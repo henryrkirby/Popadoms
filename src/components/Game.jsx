@@ -1,244 +1,525 @@
 /**
- * Game.jsx — Main game component. Orchestrates everything:
- * - Canvas setup and game loop
- * - Popadom creation, fracture, and physics
+ * Game.jsx — Main game component using React Three Fiber.
+ *
+ * Orchestrates:
+ * - 3D scene with table, popadom, lighting
+ * - Press-to-snap stress model (hold to build pressure, release to crack)
+ * - Voronoi fracture -> 3D fragment meshes
+ * - Fragment physics (outward impulse, table friction, settling)
  * - Contact mode switching (finger tap vs karate chop)
- * - Ambient Indian restaurant soundscape
+ * - Audio (Howler.js crack sounds + ambient Indian restaurant)
  */
 
-import { useRef, useEffect, useCallback, useState } from "react";
-import { createPopadom } from "../engine/popadom.js";
-import { precomputeVoronoi, fractureAtPoint, refractureFragment } from "../engine/fracture.js";
-import { createPhysics } from "../engine/physics.js";
-import { createPopadomTexture, createTableclothPattern, render } from "../engine/renderer.js";
-import { initAudio, playCrackSound, playSlideSound, playNewPopadomSound, startAmbient } from "../audio/soundManager.js";
-import { setupInput } from "../input/inputHandler.js";
+import { useRef, useCallback, useState, useMemo, useEffect } from "react";
+import { Canvas, useFrame } from "@react-three/fiber";
+import { OrbitControls } from "@react-three/drei";
+import * as THREE from "three";
 
-export default function Game() {
-  const canvasRef = useRef(null);
-  const gameStateRef = useRef(null);
-  const animFrameRef = useRef(null);
-  const cleanupInputRef = useRef(null);
-  const [showNewButton, setShowNewButton] = useState(false);
-  const [contactMode, setContactMode] = useState("finger"); // "finger" or "chop"
-  const ambientStartedRef = useRef(false);
+import { createPopadomData, sampleHeightmap } from "../engine/popadom.js";
+import { precomputeCells, fractureAtPoint, buildFragmentGeometry, refractureFragment } from "../engine/fracture.js";
+import { createFragmentBody, stepPhysics } from "../engine/physics.js";
+import { initAudio, playCrackSound, playNewPopadomSound, startAmbient } from "../audio/soundManager.js";
 
-  const initGame = useCallback((canvas) => {
-    const width = canvas.width;
-    const height = canvas.height;
+// ─── Popadom texture (procedural, on a canvas) ────────────────
 
-    const radius = Math.min(width, height) * 0.35;
-    const centerX = width / 2;
-    const centerY = height / 2;
+function createPopadomCanvasTexture(heightmap, resolution = 512) {
+  const canvas = document.createElement("canvas");
+  canvas.width = resolution;
+  canvas.height = resolution;
+  const ctx = canvas.getContext("2d");
+  const imageData = ctx.createImageData(resolution, resolution);
+  const pixels = imageData.data;
+  const halfRes = resolution / 2;
 
-    const popadom = createPopadom(centerX, centerY, radius);
-    const cells = precomputeVoronoi(popadom, 60);
-    const texture = createPopadomTexture(popadom);
-    const tableclothCanvas = createTableclothPattern(width, height);
+  for (let py = 0; py < resolution; py++) {
+    for (let px = 0; px < resolution; px++) {
+      const dx = px - halfRes;
+      const dy = py - halfRes;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      if (dist > halfRes * 1.02) continue;
 
-    let physics = gameStateRef.current?.physics;
-    if (physics) {
-      physics.clearFragments();
-      physics.resize(width, height);
+      const hx = Math.floor((px / resolution) * heightmap.width);
+      const hy = Math.floor((py / resolution) * heightmap.height);
+      const h = heightmap.data[hy * heightmap.width + hx] || 0.5;
+
+      let r = 200 + h * 45;
+      let g = 155 + h * 40;
+      let b = 65 + h * 30;
+
+      if (h < 0.28) {
+        const ci = (0.28 - h) * 3.0;
+        r -= ci * 60;
+        g -= ci * 50;
+        b -= ci * 25;
+      }
+
+      const grain = (Math.sin(px * 127.1 + py * 311.7) * 43758.5453) % 1;
+      const speckle = (grain - 0.5) * 12;
+
+      const edgeFactor = dist / halfRes;
+      let edgeDarken = 0;
+      if (edgeFactor > 0.82) edgeDarken = (edgeFactor - 0.82) * 280;
+
+      let shadow = 0;
+      if (hx > 0 && hy > 0 && hx < heightmap.width && hy < heightmap.height) {
+        const hLeft = heightmap.data[hy * heightmap.width + (hx - 1)] || 0.5;
+        const hUp = heightmap.data[(hy - 1) * heightmap.width + hx] || 0.5;
+        shadow = ((h - hLeft) + (h - hUp)) * 55;
+      }
+
+      const idx = (py * resolution + px) * 4;
+      pixels[idx] = Math.max(0, Math.min(255, r + speckle + shadow - edgeDarken));
+      pixels[idx + 1] = Math.max(0, Math.min(255, g + speckle + shadow * 0.8 - edgeDarken));
+      pixels[idx + 2] = Math.max(0, Math.min(255, b + speckle + shadow * 0.5 - edgeDarken));
+
+      let alpha = 255;
+      if (dist > halfRes * 0.97) {
+        alpha = Math.max(0, 255 * (1 - (dist - halfRes * 0.97) / (halfRes * 0.05)));
+      }
+      pixels[idx + 3] = alpha;
+    }
+  }
+
+  ctx.putImageData(imageData, 0, 0);
+
+  // Bubble highlights
+  ctx.globalCompositeOperation = "screen";
+  for (let y = 0; y < heightmap.height; y++) {
+    for (let x = 0; x < heightmap.width; x++) {
+      const h = heightmap.data[y * heightmap.width + x];
+      if (h > 0.68) {
+        const pxX = (x / heightmap.width) * resolution;
+        const pxY = (y / heightmap.height) * resolution;
+        const ddx = pxX - halfRes;
+        const ddy = pxY - halfRes;
+        if (ddx * ddx + ddy * ddy > halfRes * halfRes) continue;
+        const intensity = (h - 0.68) * 3.0;
+        const br = 1.5 + intensity * 3;
+        ctx.beginPath();
+        ctx.arc(pxX - 1.5, pxY - 1.5, br, 0, Math.PI * 2);
+        ctx.fillStyle = `rgba(255, 245, 210, ${Math.min(0.35, intensity * 0.3)})`;
+        ctx.fill();
+      }
+    }
+  }
+  ctx.globalCompositeOperation = "source-over";
+
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  return texture;
+}
+
+// ─── Popadom disc geometry ─────────────────────────────────────
+
+function createPopadomGeometry(popadomData, segments = 64) {
+  const { radius, heightmap, edgeOffsets, edgeSegments } = popadomData;
+  const rings = 24;
+  const positions = [];
+  const normals = [];
+  const uvs = [];
+  const indices = [];
+
+  for (let r = 0; r <= rings; r++) {
+    const t = r / rings;
+    for (let s = 0; s <= segments; s++) {
+      const angle = (s / segments) * Math.PI * 2;
+      const segIdx = s % edgeSegments;
+      const edgeWobble = t > 0.7 ? edgeOffsets[segIdx] * ((t - 0.7) / 0.3) : 0;
+      const rad = radius * t * (1 + edgeWobble);
+
+      const x = Math.cos(angle) * rad;
+      const z = Math.sin(angle) * rad;
+
+      const u = (x / radius + 1) / 2;
+      const v = (z / radius + 1) / 2;
+
+      const h = sampleHeightmap(heightmap, u, v);
+      const y = h * 0.025 * t;
+
+      positions.push(x, y, z);
+      normals.push(0, 1, 0);
+      uvs.push(u, v);
+    }
+  }
+
+  for (let r = 0; r < rings; r++) {
+    for (let s = 0; s < segments; s++) {
+      const a = r * (segments + 1) + s;
+      const b = a + segments + 1;
+      indices.push(a, b, a + 1);
+      indices.push(a + 1, b, b + 1);
+    }
+  }
+
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+  geo.setAttribute("normal", new THREE.Float32BufferAttribute(normals, 3));
+  geo.setAttribute("uv", new THREE.Float32BufferAttribute(uvs, 2));
+  geo.setIndex(indices);
+  geo.computeVertexNormals();
+
+  return geo;
+}
+
+// ─── Fragment mesh component ───────────────────────────────────
+
+function Fragment({ body, popadomData, texture }) {
+  const meshRef = useRef();
+  const geometry = useMemo(
+    () => buildFragmentGeometry(body.cell, popadomData),
+    [body.cell, popadomData]
+  );
+
+  useFrame(() => {
+    if (!meshRef.current) return;
+    meshRef.current.position.set(
+      body.x - body.cell.centroid[0],
+      body.y + 0.013,
+      body.z - body.cell.centroid[1]
+    );
+    meshRef.current.rotation.set(body.tiltX, body.rotation, body.tiltZ);
+  });
+
+  return (
+    <mesh ref={meshRef} geometry={geometry} castShadow receiveShadow>
+      <meshStandardMaterial
+        map={texture}
+        roughness={0.85}
+        metalness={0.02}
+        side={THREE.DoubleSide}
+      />
+    </mesh>
+  );
+}
+
+// ─── Intact popadom mesh ───────────────────────────────────────
+
+function IntactPopadom({ popadomData, cells, texture, onPointerDown, onPointerUp, pressRef }) {
+  const meshRef = useRef();
+  const geometry = useMemo(
+    () => createPopadomGeometry(popadomData),
+    [popadomData]
+  );
+  const targetScale = useRef(new THREE.Vector3(1, 1, 1));
+
+  useFrame(() => {
+    if (!meshRef.current) return;
+    if (pressRef.current.pressing) {
+      const s = 1 - pressRef.current.pressure * 0.02;
+      targetScale.current.set(s, s, s);
     } else {
-      physics = createPhysics(width, height);
+      targetScale.current.set(1, 1, 1);
+    }
+    meshRef.current.scale.lerp(targetScale.current, 0.15);
+  });
+
+  const intactCount = cells.filter((c) => c.intact).length;
+  if (intactCount === 0) return null;
+
+  return (
+    <mesh
+      ref={meshRef}
+      geometry={geometry}
+      position={[0, 0.013, 0]}
+      castShadow
+      receiveShadow
+      onPointerDown={onPointerDown}
+      onPointerUp={onPointerUp}
+    >
+      <meshStandardMaterial
+        map={texture}
+        roughness={0.82}
+        metalness={0.02}
+        transparent
+        opacity={0.98}
+        side={THREE.DoubleSide}
+      />
+    </mesh>
+  );
+}
+
+// ─── Table surface ─────────────────────────────────────────────
+
+function Table() {
+  const texture = useMemo(() => {
+    const size = 512;
+    const canvas = document.createElement("canvas");
+    canvas.width = size;
+    canvas.height = size;
+    const ctx = canvas.getContext("2d");
+
+    ctx.fillStyle = "#8B1A2B";
+    ctx.fillRect(0, 0, size, size);
+
+    for (let y = 0; y < size; y += 3) {
+      for (let x = 0; x < size; x += 3) {
+        const noise = (Math.sin(x * 73.7 + y * 157.3) * 43758.5453) % 1;
+        const v = (noise - 0.5) * 12;
+        ctx.fillStyle = `rgb(${139 + v}, ${26 + v * 0.3}, ${43 + v * 0.4})`;
+        ctx.fillRect(x, y, 3, 3);
+      }
     }
 
-    gameStateRef.current = {
-      width,
-      height,
-      popadom,
-      cells,
-      physics,
-      texture,
-      tableclothCanvas,
-      contactMode: contactMode,
-      dragTarget: null,
-    };
+    const bandSpacing = 120;
+    const bandWidth = 28;
+    ctx.globalAlpha = 0.12;
+    ctx.fillStyle = "#D4A843";
+    for (let offset = bandSpacing; offset < size; offset += bandSpacing) {
+      ctx.fillRect(0, offset - bandWidth / 2, size, bandWidth);
+      ctx.fillRect(offset - bandWidth / 2, 0, bandWidth, size);
+    }
 
-    setShowNewButton(false);
-  }, [contactMode]);
+    ctx.globalAlpha = 0.15;
+    ctx.fillStyle = "#F0D060";
+    for (let y = bandSpacing; y < size; y += bandSpacing) {
+      for (let x = bandSpacing; x < size; x += bandSpacing) {
+        ctx.save();
+        ctx.translate(x, y);
+        ctx.rotate(Math.PI / 4);
+        ctx.fillRect(-5, -5, 10, 10);
+        ctx.restore();
+      }
+    }
+    ctx.globalAlpha = 1;
 
-  // Keep gameState.contactMode in sync
+    const tex = new THREE.CanvasTexture(canvas);
+    tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+    tex.repeat.set(3, 3);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    return tex;
+  }, []);
+
+  return (
+    <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, -0.001, 0]} receiveShadow>
+      <planeGeometry args={[8, 8]} />
+      <meshStandardMaterial map={texture} roughness={0.9} metalness={0.0} />
+    </mesh>
+  );
+}
+
+// ─── Stress indicator ring ─────────────────────────────────────
+
+function StressRing({ pressRef }) {
+  const ringRef = useRef();
+
+  useFrame(() => {
+    if (!ringRef.current) return;
+    const p = pressRef.current;
+    if (p.pressing && p.worldX !== null) {
+      ringRef.current.visible = true;
+      ringRef.current.position.set(p.worldX, 0.02, p.worldZ);
+      const scale = 0.1 + p.pressure * 0.8;
+      ringRef.current.scale.set(scale, scale, 1);
+      ringRef.current.material.opacity = 0.15 + p.pressure * 0.3;
+    } else {
+      ringRef.current.visible = false;
+    }
+  });
+
+  return (
+    <mesh ref={ringRef} rotation={[-Math.PI / 2, 0, 0]} visible={false}>
+      <ringGeometry args={[0.8, 1.0, 32]} />
+      <meshBasicMaterial color="#fff8e0" transparent opacity={0.2} side={THREE.DoubleSide} />
+    </mesh>
+  );
+}
+
+// ─── Scene (inner component, lives inside Canvas) ──────────────
+
+function Scene({ contactMode, onAllBroken, popadomKey }) {
+  const ambientStarted = useRef(false);
+
+  const popadomData = useMemo(() => createPopadomData(1.0), [popadomKey]);
+  const cellsRef = useRef([]);
+  const fragmentsRef = useRef([]);
+  const [, forceRender] = useState(0);
+
+  const texture = useMemo(
+    () => createPopadomCanvasTexture(popadomData.heightmap),
+    [popadomData]
+  );
+
+  // Reset on new popadom
   useEffect(() => {
-    if (gameStateRef.current) {
-      gameStateRef.current.contactMode = contactMode;
-    }
-  }, [contactMode]);
+    cellsRef.current = precomputeCells(popadomData, 55);
+    fragmentsRef.current = [];
+    forceRender((n) => n + 1);
+  }, [popadomData]);
 
-  const handleTap = useCallback((x, y) => {
-    const state = gameStateRef.current;
-    if (!state) return;
+  // Stress model
+  const pressRef = useRef({
+    pressing: false,
+    startTime: 0,
+    pressure: 0,
+    worldX: null,
+    worldZ: null,
+  });
+
+  useFrame((_, delta) => {
+    const p = pressRef.current;
+    if (p.pressing) {
+      p.pressure = Math.min(1, (performance.now() - p.startTime) / 1000);
+    }
+
+    if (fragmentsRef.current.length > 0) {
+      stepPhysics(fragmentsRef.current, Math.min(delta, 0.033));
+    }
+  });
+
+  const handlePointerDown = useCallback((e) => {
+    e.stopPropagation();
 
     initAudio();
-
-    // Start ambient on first interaction
-    if (!ambientStartedRef.current) {
-      ambientStartedRef.current = true;
+    if (!ambientStarted.current) {
+      ambientStarted.current = true;
       startAmbient();
     }
 
-    const { cells, physics, popadom } = state;
-    const mode = state.contactMode || "finger";
-
-    // Check if we tapped on an existing fragment
-    const hitBody = physics.bodyAtPoint(x, y);
-    if (hitBody && hitBody.popadomData) {
-      const subFragments = refractureFragment(hitBody.popadomData, x, y);
-      if (subFragments) {
-        physics.removeBody(hitBody);
-        for (const sub of subFragments) {
-          physics.addFragment(sub, x, y);
-        }
-        playCrackSound(0.3, subFragments.length);
-        return;
-      }
-    }
-
-    // Crack the intact popadom
-    const intactCount = cells.filter((c) => c.intact).length;
-    if (intactCount === 0) return;
-
-    const newlyBroken = fractureAtPoint(cells, x, y, popadom.radius, 1, mode);
-
-    if (newlyBroken.length > 0) {
-      for (const cell of newlyBroken) {
-        physics.addFragment(cell, x, y);
-      }
-
-      const intensity = Math.min(1, newlyBroken.length / 8);
-      playCrackSound(intensity, newlyBroken.length);
-    }
-
-    // Check if fully broken
-    const remaining = cells.filter((c) => c.intact).length;
-    if (remaining === 0) {
-      setShowNewButton(true);
-    }
+    const point = e.point;
+    pressRef.current = {
+      pressing: true,
+      startTime: performance.now(),
+      pressure: 0,
+      worldX: point.x,
+      worldZ: point.z,
+    };
   }, []);
 
-  // Karate chop: swipe detection — track swipe and fracture along the line
-  const handleChopSwipe = useCallback((x, y, dx, dy) => {
-    const state = gameStateRef.current;
-    if (!state || state.contactMode !== "chop") return;
+  const handlePointerUp = useCallback(() => {
+    const p = pressRef.current;
+    if (!p.pressing) return;
 
-    const speed = Math.sqrt(dx * dx + dy * dy);
-    if (speed < 5) return; // need some velocity for a chop
+    const tapX = p.worldX;
+    const tapZ = p.worldZ;
+    const pressure = p.pressure;
 
-    const { cells, physics, popadom } = state;
-    const intactCount = cells.filter((c) => c.intact).length;
-    if (intactCount === 0) return;
+    p.pressing = false;
+    p.pressure = 0;
 
-    // Calculate swipe angle
-    const angle = Math.atan2(dy, dx);
+    const currentCells = cellsRef.current;
+    const intactBefore = currentCells.filter((c) => c.intact).length;
+    if (intactBefore === 0) return;
 
-    const newlyBroken = fractureAtPoint(cells, x, y, popadom.radius, 1, "chop");
+    const mode = contactMode === "chop" ? "chop" : "finger";
+    const broken = fractureAtPoint(currentCells, tapX, tapZ, 1.0, pressure, mode);
 
-    if (newlyBroken.length > 0) {
-      for (const cell of newlyBroken) {
-        physics.addFragment(cell, x, y);
-      }
-      const intensity = Math.min(1, newlyBroken.length / 6);
-      playCrackSound(intensity, newlyBroken.length);
+    if (broken.length > 0) {
+      const newBodies = broken.map((cell) => createFragmentBody(cell, tapX, tapZ));
+      fragmentsRef.current = [...fragmentsRef.current, ...newBodies];
+      forceRender((n) => n + 1);
+
+      const intensity = Math.min(1, broken.length / 8);
+      playCrackSound(intensity, broken.length);
     }
 
-    const remaining = cells.filter((c) => c.intact).length;
-    if (remaining === 0) {
-      setShowNewButton(true);
+    const intactAfter = currentCells.filter((c) => c.intact).length;
+    if (intactAfter === 0) {
+      onAllBroken();
     }
+  }, [contactMode, onAllBroken]);
+
+  const handleFragmentTap = useCallback((e, body) => {
+    e.stopPropagation();
+    initAudio();
+
+    const point = e.point;
+    const subs = refractureFragment(body.cell, point.x, point.z);
+    if (!subs) return;
+
+    const oldBodies = fragmentsRef.current.filter((b) => b.id !== body.id);
+    const newBodies = subs.map((cell) => createFragmentBody(cell, point.x, point.z));
+    fragmentsRef.current = [...oldBodies, ...newBodies];
+    forceRender((n) => n + 1);
+
+    playCrackSound(0.3, subs.length);
   }, []);
 
-  const handleDragMove = useCallback((x, y, dx, dy) => {
-    const state = gameStateRef.current;
-    if (!state) return;
+  return (
+    <>
+      <ambientLight intensity={0.4} />
+      <directionalLight
+        position={[3, 5, 2]}
+        intensity={1.2}
+        castShadow
+        shadow-mapSize-width={1024}
+        shadow-mapSize-height={1024}
+        shadow-camera-near={0.5}
+        shadow-camera-far={15}
+        shadow-camera-left={-3}
+        shadow-camera-right={3}
+        shadow-camera-top={3}
+        shadow-camera-bottom={-3}
+      />
+      <pointLight position={[-2, 3, -1]} intensity={0.3} color="#ffe8c0" />
 
-    // In chop mode, dragging across the popadom creates chop fractures
-    if (state.contactMode === "chop") {
-      handleChopSwipe(x, y, dx, dy);
-      return;
-    }
+      <Table />
+      <StressRing pressRef={pressRef} />
 
-    // In finger mode, drag pushes fragments around
-    const body = state.physics.bodyAtPoint(x, y);
-    if (body && body.label === "fragment") {
-      const force = 0.0003;
-      state.physics.pushBody(body, dx * force, dy * force);
+      <IntactPopadom
+        popadomData={popadomData}
+        cells={cellsRef.current}
+        texture={texture}
+        onPointerDown={handlePointerDown}
+        onPointerUp={handlePointerUp}
+        pressRef={pressRef}
+      />
 
-      const speed = Math.sqrt(dx * dx + dy * dy);
-      playSlideSound(speed);
-    }
-  }, [handleChopSwipe]);
+      {fragmentsRef.current.map((body) => (
+        <group key={body.id} onPointerDown={(e) => handleFragmentTap(e, body)}>
+          <Fragment body={body} popadomData={popadomData} texture={texture} />
+        </group>
+      ))}
+
+      <OrbitControls
+        enablePan={false}
+        enableZoom={true}
+        minPolarAngle={0.2}
+        maxPolarAngle={Math.PI / 3}
+        minDistance={1.5}
+        maxDistance={5}
+        target={[0, 0, 0]}
+      />
+    </>
+  );
+}
+
+// ─── Main Game component ───────────────────────────────────────
+
+export default function Game() {
+  const [showNewButton, setShowNewButton] = useState(false);
+  const [contactMode, setContactMode] = useState("finger");
+  const [popadomKey, setPopadomKey] = useState(0);
+
+  const handleAllBroken = useCallback(() => {
+    setShowNewButton(true);
+  }, []);
 
   const handleNewPopadom = useCallback(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
     playNewPopadomSound();
-    initGame(canvas);
-  }, [initGame]);
+    setPopadomKey((k) => k + 1);
+    setShowNewButton(false);
+  }, []);
 
   const toggleContactMode = useCallback(() => {
     setContactMode((prev) => (prev === "finger" ? "chop" : "finger"));
   }, []);
 
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-
-    const ctx = canvas.getContext("2d");
-
-    function resize() {
-      canvas.width = window.innerWidth;
-      canvas.height = window.innerHeight;
-      initGame(canvas);
-    }
-
-    resize();
-    window.addEventListener("resize", resize);
-
-    cleanupInputRef.current = setupInput(canvas, {
-      onTap: handleTap,
-      onDragStart: () => {},
-      onDragMove: handleDragMove,
-      onDragEnd: () => {},
-    });
-
-    let lastTime = performance.now();
-    function gameLoop(timestamp) {
-      const delta = timestamp - lastTime;
-      lastTime = timestamp;
-
-      const state = gameStateRef.current;
-      if (state) {
-        state.physics.update(Math.min(delta, 32));
-        render(ctx, state);
-      }
-
-      animFrameRef.current = requestAnimationFrame(gameLoop);
-    }
-
-    animFrameRef.current = requestAnimationFrame(gameLoop);
-
-    return () => {
-      window.removeEventListener("resize", resize);
-      if (cleanupInputRef.current) cleanupInputRef.current();
-      if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
-    };
-  }, [initGame, handleTap, handleDragMove]);
-
   return (
     <div style={{ position: "relative", width: "100vw", height: "100vh", overflow: "hidden" }}>
-      <canvas
-        ref={canvasRef}
-        style={{
-          display: "block",
-          width: "100%",
-          height: "100%",
-          touchAction: "none",
-          cursor: contactMode === "chop" ? "grab" : "pointer",
-        }}
-      />
+      <Canvas
+        shadows
+        camera={{ position: [0, 3.2, 1.8], fov: 40, near: 0.1, far: 50 }}
+        style={{ background: "#1a0a05" }}
+        gl={{ antialias: true, toneMapping: THREE.ACESFilmicToneMapping, toneMappingExposure: 1.0 }}
+      >
+        <Scene
+          contactMode={contactMode}
+          onAllBroken={handleAllBroken}
+          popadomKey={popadomKey}
+        />
+      </Canvas>
 
-      {/* Contact mode toggle button */}
+      {/* Contact mode toggle */}
       <button
         onClick={toggleContactMode}
         style={{
@@ -259,6 +540,7 @@ export default function Game() {
           backdropFilter: "blur(8px)",
           boxShadow: "0 2px 12px rgba(0,0,0,0.3)",
           transition: "all 0.2s ease",
+          zIndex: 10,
         }}
         onMouseEnter={(e) => {
           e.target.style.background = "rgba(0, 0, 0, 0.7)";
@@ -273,7 +555,6 @@ export default function Game() {
         {contactMode === "finger" ? "\u261D\uFE0F" : "\u270B"}
       </button>
 
-      {/* Mode label */}
       <div
         style={{
           position: "absolute",
@@ -286,12 +567,30 @@ export default function Game() {
           width: "56px",
           opacity: 0.7,
           textShadow: "0 1px 3px rgba(0,0,0,0.5)",
+          zIndex: 10,
         }}
       >
         {contactMode === "finger" ? "Tap" : "Chop"}
       </div>
 
-      {/* New Popadom button */}
+      <div
+        style={{
+          position: "absolute",
+          bottom: showNewButton ? "100px" : "30px",
+          left: "50%",
+          transform: "translateX(-50%)",
+          color: "rgba(255, 245, 230, 0.5)",
+          fontSize: "13px",
+          fontFamily: "'Georgia', serif",
+          textShadow: "0 1px 3px rgba(0,0,0,0.5)",
+          pointerEvents: "none",
+          transition: "all 0.3s ease",
+          zIndex: 10,
+        }}
+      >
+        Hold longer to crack more
+      </div>
+
       {showNewButton && (
         <button
           onClick={handleNewPopadom}
@@ -312,6 +611,7 @@ export default function Game() {
             boxShadow: "0 4px 20px rgba(0,0,0,0.2)",
             transition: "all 0.2s ease",
             letterSpacing: "1px",
+            zIndex: 10,
           }}
           onMouseEnter={(e) => {
             e.target.style.background = "rgba(160, 105, 50, 0.95)";

@@ -1,70 +1,57 @@
 /**
- * fracture.js — Dynamic fracture system for popadom breaking.
+ * fracture.js — 3D Voronoi-based fracture for the popadom disc.
  *
- * Instead of pre-computing a grid of Voronoi cells, this generates cracks
- * dynamically from the press point. A finger tap creates radial cracks
- * outward from the press. A karate chop creates a line crack across
- * the popadom. The result feels much more like breaking a real popadom.
- *
- * How it works:
- * 1. The popadom starts as a single intact polygon (its outline).
- * 2. When the user taps, we generate crack lines radiating from the tap point.
- * 3. These crack lines split the popadom polygon into separate pieces.
- * 4. Each piece becomes either an intact region or a broken fragment.
+ * 1. Pre-seeds Voronoi cells across the disc (stored but hidden).
+ * 2. When the user taps, cells near the press point are "released" as fragments.
+ * 3. Each fragment gets extruded into a thin 3D mesh (BufferGeometry).
+ * 4. The stress model determines which cells break based on distance, thickness,
+ *    and accumulated pressure.
  */
 
+import * as THREE from "three";
 import { Delaunay } from "d3-delaunay";
 import { sampleHeightmap } from "./popadom.js";
 
 /**
- * Initial setup: create the popadom as a single unbroken region.
- * We still use a Voronoi tessellation internally, but with far fewer cells,
- * and we don't show the cell boundaries — they're only used as the
- * geometry for splitting when a crack passes through.
+ * Pre-compute Voronoi cells across the popadom disc.
+ * Returns an array of cell objects with 2D polygon vertices in the XZ plane.
  */
-export function precomputeVoronoi(popadom, cellCount = 60) {
-  const { centerX, centerY, radius, heightmap } = popadom;
-
-  // Generate seed points spread across the popadom
-  const seeds = [];
+export function precomputeCells(popadomData, cellCount = 55) {
+  const { radius, heightmap } = popadomData;
   const radiusSq = radius * radius;
 
+  const seeds = [];
   while (seeds.length < cellCount) {
-    const x = centerX - radius + Math.random() * radius * 2;
-    const y = centerY - radius + Math.random() * radius * 2;
-    const dx = x - centerX;
-    const dy = y - centerY;
-    if (dx * dx + dy * dy <= radiusSq * 0.95) {
-      seeds.push([x, y]);
+    const x = (Math.random() * 2 - 1) * radius;
+    const z = (Math.random() * 2 - 1) * radius;
+    if (x * x + z * z <= radiusSq * 0.92) {
+      seeds.push([x, z]);
     }
   }
 
-  // Build Voronoi
-  const margin = radius * 1.2;
-  const bounds = [
-    centerX - margin, centerY - margin,
-    centerX + margin, centerY + margin,
-  ];
+  const margin = radius * 1.3;
+  const bounds = [-margin, -margin, margin, margin];
   const delaunay = Delaunay.from(seeds);
   const voronoi = delaunay.voronoi(bounds);
 
   const cells = [];
   for (let i = 0; i < seeds.length; i++) {
-    const cellPoly = voronoi.cellPolygon(i);
-    if (!cellPoly) continue;
+    const rawPoly = voronoi.cellPolygon(i);
+    if (!rawPoly) continue;
 
-    const clipped = clipPolygonToCircle(cellPoly, centerX, centerY, radius);
+    const clipped = clipToDisc(rawPoly, radius);
     if (clipped.length < 3) continue;
 
     const area = polygonArea(clipped);
-    if (area < 15) continue;
+    if (area < 0.005) continue;
 
     const centroid = polygonCentroid(clipped);
-    const localX = centroid[0] - (centerX - radius);
-    const localY = centroid[1] - (centerY - radius);
-    const thickness = sampleHeightmap(heightmap, localX, localY, radius * 2);
+    const u = (centroid[0] / radius + 1) / 2;
+    const v = (centroid[1] / radius + 1) / 2;
+    const thickness = sampleHeightmap(heightmap, u, v);
 
     cells.push({
+      id: i,
       seed: seeds[i],
       vertices: clipped,
       centroid,
@@ -78,45 +65,30 @@ export function precomputeVoronoi(popadom, cellCount = 60) {
 }
 
 /**
- * Fracture at a point — "finger tap" mode.
- * Cracks radiate outward from the tap point. Cells near the tap break off.
- * The crack radius and pattern depend on where you press.
- *
- * If you press in the center, you get a larger crack area.
- * If you press near the edge, fewer pieces break.
+ * Determine which cells break from a tap/press.
  */
-export function fractureAtPoint(cells, tapX, tapY, radius, force = 1, mode = "finger") {
-  const newlyBroken = [];
-
+export function fractureAtPoint(cells, tapX, tapZ, radius, pressure = 0.5, mode = "finger") {
   if (mode === "chop") {
-    return fractureChop(cells, tapX, tapY, radius, force);
+    return fractureChop(cells, tapX, tapZ, radius, pressure);
   }
 
-  // Finger tap: radial crack from tap point
-  // Crack extends further with more force, but limited to realistic range
-  const crackRadius = radius * (0.25 + Math.random() * 0.2) * force;
+  const newlyBroken = [];
+  const crackRadius = radius * (0.2 + pressure * 0.4 + Math.random() * 0.1);
 
-  // Determine which cells to break — biased by distance and thickness
   for (const cell of cells) {
     if (!cell.intact) continue;
 
     const dx = cell.centroid[0] - tapX;
-    const dy = cell.centroid[1] - tapY;
-    const dist = Math.sqrt(dx * dx + dy * dy);
+    const dz = cell.centroid[1] - tapZ;
+    const dist = Math.sqrt(dx * dx + dz * dz);
 
     if (dist > crackRadius) continue;
 
-    // Closer to tap = higher break probability
-    const distanceFactor = 1 - (dist / crackRadius);
-
-    // Thinner areas break more easily
+    const distanceFactor = 1 - dist / crackRadius;
     const thicknessFactor = 1 - cell.thickness * 0.6;
+    const breakProb = distanceFactor * thicknessFactor * (0.5 + pressure * 0.5);
 
-    const breakProb = distanceFactor * thicknessFactor;
-
-    // Near the center of the tap: almost certain to break
-    // Further out: probabilistic
-    if (dist < crackRadius * 0.3 || Math.random() < breakProb * 0.85 + 0.15) {
+    if (dist < crackRadius * 0.25 || Math.random() < breakProb * 0.85 + 0.15) {
       cell.intact = false;
       newlyBroken.push(cell);
     }
@@ -125,39 +97,21 @@ export function fractureAtPoint(cells, tapX, tapY, radius, force = 1, mode = "fi
   return newlyBroken;
 }
 
-/**
- * Karate chop fracture — a line crack across the popadom.
- * The chop creates a crack line in the direction of the swipe,
- * breaking all cells along that line.
- */
-function fractureChop(cells, tapX, tapY, radius, force) {
+function fractureChop(cells, tapX, tapZ, radius, pressure) {
   const newlyBroken = [];
-
-  // The chop creates a wide band of breakage across the popadom.
-  // Generate a random angle for the chop line (or use the swipe direction
-  // if available — force parameter carries the angle in chop mode).
-  const chopAngle = typeof force === "number" && force > 10
-    ? force  // angle in radians from swipe direction
-    : Math.random() * Math.PI;  // random if no direction
-
-  // Break cells that are close to the chop line
-  const chopWidth = radius * 0.15; // width of the chop band
+  const chopAngle = Math.random() * Math.PI;
+  const chopWidth = radius * (0.1 + pressure * 0.1);
 
   for (const cell of cells) {
     if (!cell.intact) continue;
 
     const dx = cell.centroid[0] - tapX;
-    const dy = cell.centroid[1] - tapY;
+    const dz = cell.centroid[1] - tapZ;
+    const perpDist = Math.abs(dx * Math.sin(chopAngle) - dz * Math.cos(chopAngle));
 
-    // Distance from the chop line (perpendicular distance)
-    const perpDist = Math.abs(dx * Math.sin(chopAngle) - dy * Math.cos(chopAngle));
-
-    // Only break cells close to the chop line
     if (perpDist > chopWidth) continue;
 
-    // Thinner areas break more easily
     const thicknessFactor = 1 - cell.thickness * 0.5;
-
     if (Math.random() < thicknessFactor * 0.9 + 0.1) {
       cell.intact = false;
       newlyBroken.push(cell);
@@ -168,33 +122,32 @@ function fractureChop(cells, tapX, tapY, radius, force) {
 }
 
 /**
- * Re-fracture an existing fragment into smaller pieces.
+ * Re-fracture an existing fragment into smaller sub-pieces.
  */
-export function refractureFragment(fragment, tapX, tapY) {
+export function refractureFragment(fragment, tapX, tapZ) {
   const vertices = fragment.vertices;
-  const centroid = polygonCentroid(vertices);
-  const area = polygonArea(vertices);
+  const area = fragment.area;
 
-  if (area < 300) return null;
+  if (area < 0.02) return null;
 
-  // Generate sub-points around the tap
+  const centroid = fragment.centroid;
   const subCount = 2 + Math.floor(Math.random() * 3);
-  const subSeeds = [[tapX, tapY]];
+  const subSeeds = [[tapX, tapZ]];
 
   for (let i = 0; i < subCount; i++) {
     const t = Math.random();
-    const px = tapX + (centroid[0] - tapX) * t * 2 + (Math.random() - 0.5) * 30;
-    const py = tapY + (centroid[1] - tapY) * t * 2 + (Math.random() - 0.5) * 30;
-    subSeeds.push([px, py]);
+    const px = tapX + (centroid[0] - tapX) * t * 2 + (Math.random() - 0.5) * 0.2;
+    const pz = tapZ + (centroid[1] - tapZ) * t * 2 + (Math.random() - 0.5) * 0.2;
+    subSeeds.push([px, pz]);
   }
 
   const minX = Math.min(...vertices.map((v) => v[0]));
   const maxX = Math.max(...vertices.map((v) => v[0]));
-  const minY = Math.min(...vertices.map((v) => v[1]));
-  const maxY = Math.max(...vertices.map((v) => v[1]));
+  const minZ = Math.min(...vertices.map((v) => v[1]));
+  const maxZ = Math.max(...vertices.map((v) => v[1]));
 
   const delaunay = Delaunay.from(subSeeds);
-  const voronoi = delaunay.voronoi([minX - 10, minY - 10, maxX + 10, maxY + 10]);
+  const voronoi = delaunay.voronoi([minX - 0.05, minZ - 0.05, maxX + 0.05, maxZ + 0.05]);
 
   const subFragments = [];
   for (let i = 0; i < subSeeds.length; i++) {
@@ -202,41 +155,156 @@ export function refractureFragment(fragment, tapX, tapY) {
     if (!cellPoly) continue;
 
     const clipped = clipToPolygon(cellPoly, vertices);
-    if (clipped.length >= 3 && polygonArea(clipped) > 40) {
-      subFragments.push({
-        vertices: clipped,
-        centroid: polygonCentroid(clipped),
-        area: polygonArea(clipped),
-        thickness: fragment.thickness || 0.5,
-      });
+    if (clipped.length >= 3) {
+      const subArea = polygonArea(clipped);
+      if (subArea > 0.003) {
+        subFragments.push({
+          vertices: clipped,
+          centroid: polygonCentroid(clipped),
+          area: subArea,
+          thickness: fragment.thickness || 0.5,
+        });
+      }
     }
   }
 
   return subFragments.length >= 2 ? subFragments : null;
 }
 
-// ─── Geometry utilities ──────────────────────────────────────
+/**
+ * Build a Three.js BufferGeometry for a fragment.
+ * Extrudes the 2D polygon into a thin 3D slab.
+ */
+export function buildFragmentGeometry(cell, popadomData, halfThickness = 0.012) {
+  const { vertices } = cell;
+  const { heightmap, radius } = popadomData;
+  const n = vertices.length;
 
-function clipPolygonToCircle(polygon, centerX, centerY, radius) {
-  return polygon.map((p) => {
-    const dx = p[0] - centerX;
-    const dy = p[1] - centerY;
-    const dist = Math.sqrt(dx * dx + dy * dy);
-    if (dist > radius * 1.02) {
-      const scale = (radius * 1.02) / dist;
-      return [centerX + dx * scale, centerY + dy * scale];
+  const positions = [];
+  const normals = [];
+  const uvs = [];
+  const indices = [];
+
+  const centroid = polygonCentroid(vertices);
+
+  // Top face vertices
+  for (let i = 0; i < n; i++) {
+    const v = vertices[i];
+    const u = (v[0] / radius + 1) / 2;
+    const uv = (v[1] / radius + 1) / 2;
+    const h = sampleHeightmap(heightmap, u, uv);
+    const yOffset = h * 0.02;
+
+    positions.push(v[0], halfThickness + yOffset, v[1]);
+    normals.push(0, 1, 0);
+    uvs.push(u, uv);
+  }
+
+  // Centroid for top fan
+  const cu = (centroid[0] / radius + 1) / 2;
+  const cv = (centroid[1] / radius + 1) / 2;
+  const ch = sampleHeightmap(heightmap, cu, cv);
+  positions.push(centroid[0], halfThickness + ch * 0.02, centroid[1]);
+  normals.push(0, 1, 0);
+  uvs.push(cu, cv);
+  const topCenterIdx = n;
+
+  for (let i = 0; i < n; i++) {
+    indices.push(topCenterIdx, i, (i + 1) % n);
+  }
+
+  // Bottom face
+  const bottomStart = n + 1;
+  for (let i = 0; i < n; i++) {
+    const v = vertices[i];
+    const u = (v[0] / radius + 1) / 2;
+    const uv = (v[1] / radius + 1) / 2;
+    positions.push(v[0], -halfThickness, v[1]);
+    normals.push(0, -1, 0);
+    uvs.push(u, uv);
+  }
+  positions.push(centroid[0], -halfThickness, centroid[1]);
+  normals.push(0, -1, 0);
+  uvs.push(cu, cv);
+  const bottomCenterIdx = bottomStart + n;
+
+  for (let i = 0; i < n; i++) {
+    indices.push(bottomCenterIdx, bottomStart + (i + 1) % n, bottomStart + i);
+  }
+
+  // Side faces
+  const sideStart = bottomCenterIdx + 1;
+  for (let i = 0; i < n; i++) {
+    const next = (i + 1) % n;
+    const vCurr = vertices[i];
+    const vNext = vertices[next];
+
+    const ex = vNext[0] - vCurr[0];
+    const ez = vNext[1] - vCurr[1];
+    const len = Math.sqrt(ex * ex + ez * ez) || 1;
+    const nx = ez / len;
+    const nz = -ex / len;
+
+    const baseIdx = sideStart + i * 4;
+
+    const topY_i = positions[i * 3 + 1];
+    const topY_next = positions[next * 3 + 1];
+
+    positions.push(vCurr[0], topY_i, vCurr[1]);
+    normals.push(nx, 0, nz);
+    uvs.push(0, 1);
+
+    positions.push(vNext[0], topY_next, vNext[1]);
+    normals.push(nx, 0, nz);
+    uvs.push(1, 1);
+
+    positions.push(vNext[0], -halfThickness, vNext[1]);
+    normals.push(nx, 0, nz);
+    uvs.push(1, 0);
+
+    positions.push(vCurr[0], -halfThickness, vCurr[1]);
+    normals.push(nx, 0, nz);
+    uvs.push(0, 0);
+
+    indices.push(baseIdx, baseIdx + 1, baseIdx + 2);
+    indices.push(baseIdx, baseIdx + 2, baseIdx + 3);
+  }
+
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+  geometry.setAttribute("normal", new THREE.Float32BufferAttribute(normals, 3));
+  geometry.setAttribute("uv", new THREE.Float32BufferAttribute(uvs, 2));
+  geometry.setIndex(indices);
+  geometry.computeBoundingSphere();
+
+  return geometry;
+}
+
+// ─── Geometry helpers ──────────────────────────────────────────
+
+function clipToDisc(polygon, radius) {
+  const result = [];
+  const rSq = radius * radius;
+  for (const p of polygon) {
+    const x = p[0], z = p[1];
+    const dSq = x * x + z * z;
+    if (dSq <= rSq) {
+      result.push([x, z]);
+    } else {
+      const scale = radius / Math.sqrt(dSq);
+      result.push([x * scale, z * scale]);
     }
-    return p;
-  });
+  }
+  return result;
 }
 
 export function polygonCentroid(vertices) {
-  let cx = 0, cy = 0;
+  let cx = 0, cz = 0;
   for (const v of vertices) {
     cx += v[0];
-    cy += v[1];
+    cz += v[1];
   }
-  return [cx / vertices.length, cy / vertices.length];
+  return [cx / vertices.length, cz / vertices.length];
 }
 
 export function polygonArea(vertices) {
@@ -288,8 +356,7 @@ function clipToPolygon(subject, clip) {
 function isInside(point, edgeStart, edgeEnd) {
   return (
     (edgeEnd[0] - edgeStart[0]) * (point[1] - edgeStart[1]) -
-      (edgeEnd[1] - edgeStart[1]) * (point[0] - edgeStart[0]) >=
-    0
+      (edgeEnd[1] - edgeStart[1]) * (point[0] - edgeStart[0]) >= 0
   );
 }
 
@@ -297,9 +364,7 @@ function intersect(a, b, c, d) {
   const denom =
     (a[0] - b[0]) * (c[1] - d[1]) - (a[1] - b[1]) * (c[0] - d[0]);
   if (Math.abs(denom) < 1e-10) return null;
-
   const t =
     ((a[0] - c[0]) * (c[1] - d[1]) - (a[1] - c[1]) * (c[0] - d[0])) / denom;
-
   return [a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])];
 }

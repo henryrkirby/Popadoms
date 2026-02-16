@@ -10,13 +10,16 @@ html, body, #root {
   width: 100%;
   height: 100%;
   overflow: hidden;
-  background: #8B1A2B; /* burgundy tablecloth colour, visible during load */
+  background: #1a0a05;
 }
 
 body {
-  /* Prevent pull-to-refresh and other gestures on mobile */
   overscroll-behavior: none;
   -webkit-user-select: none;
   user-select: none;
   -webkit-touch-callout: none;
+}
+
+canvas {
+  touch-action: none;
 }
