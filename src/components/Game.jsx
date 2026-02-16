@@ -1,19 +1,17 @@
 /**
- * Game.jsx — The main game component. This is where everything comes together.
- *
- * What this does:
- * - Creates the full-screen canvas
- * - Initialises the popadom, physics, and sound systems
- * - Runs the game loop (60fps render + physics update)
- * - Handles tap-to-crack and drag-to-push interactions
+ * Game.jsx — Main game component. Orchestrates everything:
+ * - Canvas setup and game loop
+ * - Popadom creation, fracture, and physics
+ * - Contact mode switching (finger tap vs karate chop)
+ * - Ambient Indian restaurant soundscape
  */
 
 import { useRef, useEffect, useCallback, useState } from "react";
 import { createPopadom } from "../engine/popadom.js";
-import { precomputeVoronoi, fractureAtPoint, refractureFragment, polygonCentroid, polygonArea } from "../engine/fracture.js";
+import { precomputeVoronoi, fractureAtPoint, refractureFragment } from "../engine/fracture.js";
 import { createPhysics } from "../engine/physics.js";
-import { createPopadomTexture, render } from "../engine/renderer.js";
-import { initAudio, playCrackSound, playSlideSound, playNewPopadomSound } from "../audio/soundManager.js";
+import { createPopadomTexture, createTableclothPattern, render } from "../engine/renderer.js";
+import { initAudio, playCrackSound, playSlideSound, playNewPopadomSound, startAmbient } from "../audio/soundManager.js";
 import { setupInput } from "../input/inputHandler.js";
 
 export default function Game() {
@@ -22,28 +20,22 @@ export default function Game() {
   const animFrameRef = useRef(null);
   const cleanupInputRef = useRef(null);
   const [showNewButton, setShowNewButton] = useState(false);
+  const [contactMode, setContactMode] = useState("finger"); // "finger" or "chop"
+  const ambientStartedRef = useRef(false);
 
-  /**
-   * Initialise or reset the game with a fresh popadom.
-   */
   const initGame = useCallback((canvas) => {
     const width = canvas.width;
     const height = canvas.height;
 
-    // Create the popadom — centred on screen, sized to fit nicely
     const radius = Math.min(width, height) * 0.35;
     const centerX = width / 2;
     const centerY = height / 2;
 
     const popadom = createPopadom(centerX, centerY, radius);
-
-    // Pre-compute the Voronoi cells (invisible fracture lines)
-    const cells = precomputeVoronoi(popadom, 90);
-
-    // Create the texture (the visual surface of the popadom)
+    const cells = precomputeVoronoi(popadom, 60);
     const texture = createPopadomTexture(popadom);
+    const tableclothCanvas = createTableclothPattern(width, height);
 
-    // Set up physics (or reuse existing, just clear fragments)
     let physics = gameStateRef.current?.physics;
     if (physics) {
       physics.clearFragments();
@@ -59,27 +51,39 @@ export default function Game() {
       cells,
       physics,
       texture,
-      dragTarget: null, // the body being dragged
+      tableclothCanvas,
+      contactMode: contactMode,
+      dragTarget: null,
     };
 
     setShowNewButton(false);
-  }, []);
+  }, [contactMode]);
 
-  /**
-   * Handle a tap/click — crack the popadom or break a fragment further.
-   */
+  // Keep gameState.contactMode in sync
+  useEffect(() => {
+    if (gameStateRef.current) {
+      gameStateRef.current.contactMode = contactMode;
+    }
+  }, [contactMode]);
+
   const handleTap = useCallback((x, y) => {
     const state = gameStateRef.current;
     if (!state) return;
 
-    initAudio(); // ensure audio is ready (browser requires user gesture)
+    initAudio();
+
+    // Start ambient on first interaction
+    if (!ambientStartedRef.current) {
+      ambientStartedRef.current = true;
+      startAmbient();
+    }
 
     const { cells, physics, popadom } = state;
+    const mode = state.contactMode || "finger";
 
-    // First, check if we tapped on an existing physics fragment
+    // Check if we tapped on an existing fragment
     const hitBody = physics.bodyAtPoint(x, y);
     if (hitBody && hitBody.popadomData) {
-      // Re-fracture this fragment into smaller pieces
       const subFragments = refractureFragment(hitBody.popadomData, x, y);
       if (subFragments) {
         physics.removeBody(hitBody);
@@ -91,37 +95,70 @@ export default function Game() {
       }
     }
 
-    // Otherwise, crack the intact popadom
+    // Crack the intact popadom
     const intactCount = cells.filter((c) => c.intact).length;
-    if (intactCount === 0) return; // nothing left to crack
+    if (intactCount === 0) return;
 
-    const newlyBroken = fractureAtPoint(cells, x, y, popadom.radius);
+    const newlyBroken = fractureAtPoint(cells, x, y, popadom.radius, 1, mode);
 
     if (newlyBroken.length > 0) {
-      // Convert broken cells to physics bodies
       for (const cell of newlyBroken) {
         physics.addFragment(cell, x, y);
       }
 
-      // Play crack sound — louder and richer for bigger cracks
       const intensity = Math.min(1, newlyBroken.length / 8);
       playCrackSound(intensity, newlyBroken.length);
     }
 
-    // Check if the whole popadom is broken
+    // Check if fully broken
     const remaining = cells.filter((c) => c.intact).length;
     if (remaining === 0) {
       setShowNewButton(true);
     }
   }, []);
 
-  /**
-   * Handle drag — push fragments around.
-   */
+  // Karate chop: swipe detection — track swipe and fracture along the line
+  const handleChopSwipe = useCallback((x, y, dx, dy) => {
+    const state = gameStateRef.current;
+    if (!state || state.contactMode !== "chop") return;
+
+    const speed = Math.sqrt(dx * dx + dy * dy);
+    if (speed < 5) return; // need some velocity for a chop
+
+    const { cells, physics, popadom } = state;
+    const intactCount = cells.filter((c) => c.intact).length;
+    if (intactCount === 0) return;
+
+    // Calculate swipe angle
+    const angle = Math.atan2(dy, dx);
+
+    const newlyBroken = fractureAtPoint(cells, x, y, popadom.radius, 1, "chop");
+
+    if (newlyBroken.length > 0) {
+      for (const cell of newlyBroken) {
+        physics.addFragment(cell, x, y);
+      }
+      const intensity = Math.min(1, newlyBroken.length / 6);
+      playCrackSound(intensity, newlyBroken.length);
+    }
+
+    const remaining = cells.filter((c) => c.intact).length;
+    if (remaining === 0) {
+      setShowNewButton(true);
+    }
+  }, []);
+
   const handleDragMove = useCallback((x, y, dx, dy) => {
     const state = gameStateRef.current;
     if (!state) return;
 
+    // In chop mode, dragging across the popadom creates chop fractures
+    if (state.contactMode === "chop") {
+      handleChopSwipe(x, y, dx, dy);
+      return;
+    }
+
+    // In finger mode, drag pushes fragments around
     const body = state.physics.bodyAtPoint(x, y);
     if (body && body.label === "fragment") {
       const force = 0.0003;
@@ -130,11 +167,8 @@ export default function Game() {
       const speed = Math.sqrt(dx * dx + dy * dy);
       playSlideSound(speed);
     }
-  }, []);
+  }, [handleChopSwipe]);
 
-  /**
-   * Handle new popadom request.
-   */
   const handleNewPopadom = useCallback(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -142,25 +176,17 @@ export default function Game() {
     initGame(canvas);
   }, [initGame]);
 
-  /**
-   * Main setup: canvas sizing, input binding, game loop.
-   */
+  const toggleContactMode = useCallback(() => {
+    setContactMode((prev) => (prev === "finger" ? "chop" : "finger"));
+  }, []);
+
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
 
     const ctx = canvas.getContext("2d");
 
-    // Size the canvas to fill the screen
     function resize() {
-      const dpr = window.devicePixelRatio || 1;
-      canvas.width = window.innerWidth * dpr;
-      canvas.height = window.innerHeight * dpr;
-      canvas.style.width = window.innerWidth + "px";
-      canvas.style.height = window.innerHeight + "px";
-      ctx.scale(dpr, dpr);
-
-      // Reinitialise the game at the new size
       canvas.width = window.innerWidth;
       canvas.height = window.innerHeight;
       initGame(canvas);
@@ -169,7 +195,6 @@ export default function Game() {
     resize();
     window.addEventListener("resize", resize);
 
-    // Set up input handling
     cleanupInputRef.current = setupInput(canvas, {
       onTap: handleTap,
       onDragStart: () => {},
@@ -177,7 +202,6 @@ export default function Game() {
       onDragEnd: () => {},
     });
 
-    // Game loop — runs every frame (~60fps)
     let lastTime = performance.now();
     function gameLoop(timestamp) {
       const delta = timestamp - lastTime;
@@ -185,10 +209,7 @@ export default function Game() {
 
       const state = gameStateRef.current;
       if (state) {
-        // Step the physics simulation
-        state.physics.update(Math.min(delta, 32)); // cap delta to prevent physics explosions
-
-        // Draw everything
+        state.physics.update(Math.min(delta, 32));
         render(ctx, state);
       }
 
@@ -197,7 +218,6 @@ export default function Game() {
 
     animFrameRef.current = requestAnimationFrame(gameLoop);
 
-    // Cleanup when component unmounts
     return () => {
       window.removeEventListener("resize", resize);
       if (cleanupInputRef.current) cleanupInputRef.current();
@@ -213,12 +233,65 @@ export default function Game() {
           display: "block",
           width: "100%",
           height: "100%",
-          touchAction: "none", // prevent browser gestures on mobile
-          cursor: "pointer",
+          touchAction: "none",
+          cursor: contactMode === "chop" ? "grab" : "pointer",
         }}
       />
 
-      {/* New Popadom button — appears when the popadom is fully broken */}
+      {/* Contact mode toggle button */}
+      <button
+        onClick={toggleContactMode}
+        style={{
+          position: "absolute",
+          top: "15px",
+          right: "15px",
+          width: "56px",
+          height: "56px",
+          borderRadius: "50%",
+          background: "rgba(0, 0, 0, 0.5)",
+          color: "#FFF5E6",
+          border: "2px solid rgba(255, 245, 230, 0.3)",
+          cursor: "pointer",
+          fontSize: "24px",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          backdropFilter: "blur(8px)",
+          boxShadow: "0 2px 12px rgba(0,0,0,0.3)",
+          transition: "all 0.2s ease",
+        }}
+        onMouseEnter={(e) => {
+          e.target.style.background = "rgba(0, 0, 0, 0.7)";
+          e.target.style.transform = "scale(1.1)";
+        }}
+        onMouseLeave={(e) => {
+          e.target.style.background = "rgba(0, 0, 0, 0.5)";
+          e.target.style.transform = "scale(1)";
+        }}
+        title={contactMode === "finger" ? "Switch to Karate Chop" : "Switch to Finger Tap"}
+      >
+        {contactMode === "finger" ? "\u261D\uFE0F" : "\u270B"}
+      </button>
+
+      {/* Mode label */}
+      <div
+        style={{
+          position: "absolute",
+          top: "78px",
+          right: "15px",
+          color: "#FFF5E6",
+          fontSize: "11px",
+          fontFamily: "'Georgia', serif",
+          textAlign: "center",
+          width: "56px",
+          opacity: 0.7,
+          textShadow: "0 1px 3px rgba(0,0,0,0.5)",
+        }}
+      >
+        {contactMode === "finger" ? "Tap" : "Chop"}
+      </div>
+
+      {/* New Popadom button */}
       {showNewButton && (
         <button
           onClick={handleNewPopadom}

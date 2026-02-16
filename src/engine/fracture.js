@@ -1,158 +1,65 @@
 /**
- * fracture.js — Voronoi-based brittle fracture system.
+ * fracture.js — Dynamic fracture system for popadom breaking.
  *
- * What this does:
- * - Pre-generates a Voronoi tessellation across the popadom shape
- * - When the user taps, determines which cells to crack based on:
- *   - Distance from tap point (closer = more likely to crack)
- *   - Surface thickness from heightmap (thinner = easier to crack)
- * - Returns polygon fragments that become physics bodies
+ * Instead of pre-computing a grid of Voronoi cells, this generates cracks
+ * dynamically from the press point. A finger tap creates radial cracks
+ * outward from the press. A karate chop creates a line crack across
+ * the popadom. The result feels much more like breaking a real popadom.
  *
- * How Voronoi shattering works (in plain English):
- * Imagine scattering a bunch of random dots on the popadom. Now draw lines
- * exactly halfway between each pair of neighbouring dots. This creates a
- * mosaic of irregular shapes — that's a Voronoi diagram. These shapes look
- * like natural crack patterns, which is why games use them for shattering.
+ * How it works:
+ * 1. The popadom starts as a single intact polygon (its outline).
+ * 2. When the user taps, we generate crack lines radiating from the tap point.
+ * 3. These crack lines split the popadom polygon into separate pieces.
+ * 4. Each piece becomes either an intact region or a broken fragment.
  */
 
 import { Delaunay } from "d3-delaunay";
 import { sampleHeightmap } from "./popadom.js";
 
 /**
- * Generate random seed points within the popadom outline.
- * More points = smaller fragments = more detailed shattering.
- *
- * @param {number} centerX
- * @param {number} centerY
- * @param {number} radius
- * @param {{ x: number, y: number }[]} outline
- * @param {number} count - number of seed points
- * @returns {number[][]} array of [x, y] points
+ * Initial setup: create the popadom as a single unbroken region.
+ * We still use a Voronoi tessellation internally, but with far fewer cells,
+ * and we don't show the cell boundaries — they're only used as the
+ * geometry for splitting when a crack passes through.
  */
-function generateSeedPoints(centerX, centerY, radius, outline, count) {
-  const points = [];
+export function precomputeVoronoi(popadom, cellCount = 60) {
+  const { centerX, centerY, radius, heightmap } = popadom;
+
+  // Generate seed points spread across the popadom
+  const seeds = [];
   const radiusSq = radius * radius;
 
-  // Use rejection sampling: pick random points in the bounding box,
-  // keep only those inside the popadom outline
-  while (points.length < count) {
+  while (seeds.length < cellCount) {
     const x = centerX - radius + Math.random() * radius * 2;
     const y = centerY - radius + Math.random() * radius * 2;
-
-    // Quick circle check first (fast), then precise polygon check if needed
     const dx = x - centerX;
     const dy = y - centerY;
-    if (dx * dx + dy * dy <= radiusSq * 1.05) {
-      points.push([x, y]);
+    if (dx * dx + dy * dy <= radiusSq * 0.95) {
+      seeds.push([x, y]);
     }
   }
 
-  return points;
-}
-
-/**
- * Check if a point is inside a polygon using ray casting.
- */
-function pointInPolygon(px, py, polygon) {
-  let inside = false;
-  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
-    const xi = polygon[i].x, yi = polygon[i].y;
-    const xj = polygon[j].x, yj = polygon[j].y;
-
-    if ((yi > py) !== (yj > py) && px < ((xj - xi) * (py - yi)) / (yj - yi) + xi) {
-      inside = !inside;
-    }
-  }
-  return inside;
-}
-
-/**
- * Clip a polygon to the popadom outline using Sutherland-Hodgman algorithm.
- * This ensures fragments don't extend beyond the popadom's edges.
- */
-function clipPolygonToCircle(polygon, centerX, centerY, radius) {
-  // Simple approach: clip each vertex to be within the radius
-  const clipped = polygon.map((p) => {
-    const dx = p[0] - centerX;
-    const dy = p[1] - centerY;
-    const dist = Math.sqrt(dx * dx + dy * dy);
-    if (dist > radius * 1.08) {
-      // Push the point inward to the edge
-      const scale = (radius * 1.08) / dist;
-      return [centerX + dx * scale, centerY + dy * scale];
-    }
-    return p;
-  });
-  return clipped;
-}
-
-/**
- * Compute the centroid (centre point) of a polygon.
- */
-function polygonCentroid(vertices) {
-  let cx = 0, cy = 0;
-  for (const v of vertices) {
-    cx += v[0];
-    cy += v[1];
-  }
-  return [cx / vertices.length, cy / vertices.length];
-}
-
-/**
- * Compute the area of a polygon (using the shoelace formula).
- */
-function polygonArea(vertices) {
-  let area = 0;
-  const n = vertices.length;
-  for (let i = 0; i < n; i++) {
-    const j = (i + 1) % n;
-    area += vertices[i][0] * vertices[j][1];
-    area -= vertices[j][0] * vertices[i][1];
-  }
-  return Math.abs(area) / 2;
-}
-
-/**
- * Pre-compute the Voronoi tessellation for a popadom.
- * Call this once when a popadom is created. The cells are invisible until
- * the user taps, at which point we "activate" some of them as cracks.
- *
- * @param {object} popadom - popadom object from createPopadom()
- * @param {number} [cellCount=90] - how many Voronoi cells
- * @returns {object[]} array of cell objects
- */
-export function precomputeVoronoi(popadom, cellCount = 90) {
-  const { centerX, centerY, radius, outline, heightmap } = popadom;
-
-  // Generate seed points
-  const seeds = generateSeedPoints(centerX, centerY, radius, outline, cellCount);
-
-  // Build the Voronoi diagram
+  // Build Voronoi
+  const margin = radius * 1.2;
   const bounds = [
-    centerX - radius * 1.2,
-    centerY - radius * 1.2,
-    centerX + radius * 1.2,
-    centerY + radius * 1.2,
+    centerX - margin, centerY - margin,
+    centerX + margin, centerY + margin,
   ];
   const delaunay = Delaunay.from(seeds);
   const voronoi = delaunay.voronoi(bounds);
 
-  // Extract each cell as a polygon, clipped to the popadom shape
   const cells = [];
   for (let i = 0; i < seeds.length; i++) {
-    const cellPolygon = voronoi.cellPolygon(i);
-    if (!cellPolygon) continue;
+    const cellPoly = voronoi.cellPolygon(i);
+    if (!cellPoly) continue;
 
-    // Clip to popadom outline
-    const clipped = clipPolygonToCircle(cellPolygon, centerX, centerY, radius);
+    const clipped = clipPolygonToCircle(cellPoly, centerX, centerY, radius);
     if (clipped.length < 3) continue;
 
     const area = polygonArea(clipped);
-    if (area < 10) continue; // skip tiny slivers
+    if (area < 15) continue;
 
     const centroid = polygonCentroid(clipped);
-
-    // Sample the heightmap at this cell's centre to get its thickness
     const localX = centroid[0] - (centerX - radius);
     const localY = centroid[1] - (centerY - radius);
     const thickness = sampleHeightmap(heightmap, localX, localY, radius * 2);
@@ -162,8 +69,8 @@ export function precomputeVoronoi(popadom, cellCount = 90) {
       vertices: clipped,
       centroid,
       area,
-      thickness, // 0-1, used for break resistance and fragment mass
-      intact: true, // becomes false when cracked off
+      thickness,
+      intact: true,
     });
   }
 
@@ -171,23 +78,25 @@ export function precomputeVoronoi(popadom, cellCount = 90) {
 }
 
 /**
- * Fracture the popadom at a tap point. Determines which cells to break
- * based on distance from tap and surface thickness.
+ * Fracture at a point — "finger tap" mode.
+ * Cracks radiate outward from the tap point. Cells near the tap break off.
+ * The crack radius and pattern depend on where you press.
  *
- * @param {object[]} cells - Voronoi cells from precomputeVoronoi()
- * @param {number} tapX - tap/click X position
- * @param {number} tapY - tap/click Y position
- * @param {number} radius - popadom radius (used for scaling distances)
- * @param {number} [force=1] - tap force multiplier (1 = normal tap)
- * @returns {object[]} array of newly broken cell objects
+ * If you press in the center, you get a larger crack area.
+ * If you press near the edge, fewer pieces break.
  */
-export function fractureAtPoint(cells, tapX, tapY, radius, force = 1) {
+export function fractureAtPoint(cells, tapX, tapY, radius, force = 1, mode = "finger") {
   const newlyBroken = [];
 
-  // The crack radius — how far from the tap the cracks spread.
-  // Scaled by force. A normal tap cracks about 30-45% of the radius.
-  const crackRadius = radius * (0.3 + Math.random() * 0.15) * force;
+  if (mode === "chop") {
+    return fractureChop(cells, tapX, tapY, radius, force);
+  }
 
+  // Finger tap: radial crack from tap point
+  // Crack extends further with more force, but limited to realistic range
+  const crackRadius = radius * (0.25 + Math.random() * 0.2) * force;
+
+  // Determine which cells to break — biased by distance and thickness
   for (const cell of cells) {
     if (!cell.intact) continue;
 
@@ -197,18 +106,59 @@ export function fractureAtPoint(cells, tapX, tapY, radius, force = 1) {
 
     if (dist > crackRadius) continue;
 
-    // Break probability: higher when closer to tap and when thinner.
-    // Distance factor: 1.0 at tap point, fading to 0 at crackRadius edge
-    const distanceFactor = 1 - dist / crackRadius;
+    // Closer to tap = higher break probability
+    const distanceFactor = 1 - (dist / crackRadius);
 
-    // Thickness factor: thin areas (low value) break easily, thick bubbles resist.
-    // Inverted: 0 thickness → 1.0 breakability, 1.0 thickness → 0.3 breakability
-    const thicknessFactor = 1 - cell.thickness * 0.7;
+    // Thinner areas break more easily
+    const thicknessFactor = 1 - cell.thickness * 0.6;
 
-    const breakProbability = distanceFactor * thicknessFactor;
+    const breakProb = distanceFactor * thicknessFactor;
 
-    // Add some randomness so it doesn't look too uniform
-    if (Math.random() < breakProbability * 0.9 + 0.1) {
+    // Near the center of the tap: almost certain to break
+    // Further out: probabilistic
+    if (dist < crackRadius * 0.3 || Math.random() < breakProb * 0.85 + 0.15) {
+      cell.intact = false;
+      newlyBroken.push(cell);
+    }
+  }
+
+  return newlyBroken;
+}
+
+/**
+ * Karate chop fracture — a line crack across the popadom.
+ * The chop creates a crack line in the direction of the swipe,
+ * breaking all cells along that line.
+ */
+function fractureChop(cells, tapX, tapY, radius, force) {
+  const newlyBroken = [];
+
+  // The chop creates a wide band of breakage across the popadom.
+  // Generate a random angle for the chop line (or use the swipe direction
+  // if available — force parameter carries the angle in chop mode).
+  const chopAngle = typeof force === "number" && force > 10
+    ? force  // angle in radians from swipe direction
+    : Math.random() * Math.PI;  // random if no direction
+
+  // Break cells that are close to the chop line
+  const chopWidth = radius * 0.15; // width of the chop band
+
+  for (const cell of cells) {
+    if (!cell.intact) continue;
+
+    const dx = cell.centroid[0] - tapX;
+    const dy = cell.centroid[1] - tapY;
+
+    // Distance from the chop line (perpendicular distance)
+    const perpDist = Math.abs(dx * Math.sin(chopAngle) - dy * Math.cos(chopAngle));
+
+    // Only break cells close to the chop line
+    if (perpDist > chopWidth) continue;
+
+    // Thinner areas break more easily
+    const thicknessFactor = 1 - cell.thickness * 0.5;
+
+    if (Math.random() < thicknessFactor * 0.9 + 0.1) {
       cell.intact = false;
       newlyBroken.push(cell);
     }
@@ -219,34 +169,25 @@ export function fractureAtPoint(cells, tapX, tapY, radius, force = 1) {
 
 /**
  * Re-fracture an existing fragment into smaller pieces.
- * Used when the user taps on an already-broken fragment.
- *
- * @param {object} fragment - a physics fragment object
- * @param {number} tapX
- * @param {number} tapY
- * @returns {object[]} array of sub-fragment vertex arrays
  */
 export function refractureFragment(fragment, tapX, tapY) {
   const vertices = fragment.vertices;
   const centroid = polygonCentroid(vertices);
   const area = polygonArea(vertices);
 
-  // Don't break very small pieces further
-  if (area < 400) return null;
+  if (area < 300) return null;
 
-  // Generate 3-5 sub-points within this fragment
-  const subCount = 3 + Math.floor(Math.random() * 3);
+  // Generate sub-points around the tap
+  const subCount = 2 + Math.floor(Math.random() * 3);
   const subSeeds = [[tapX, tapY]];
 
   for (let i = 0; i < subCount; i++) {
-    // Random points biased toward the tap location
     const t = Math.random();
-    const px = tapX + (centroid[0] - tapX) * t * 2 + (Math.random() - 0.5) * 40;
-    const py = tapY + (centroid[1] - tapY) * t * 2 + (Math.random() - 0.5) * 40;
+    const px = tapX + (centroid[0] - tapX) * t * 2 + (Math.random() - 0.5) * 30;
+    const py = tapY + (centroid[1] - tapY) * t * 2 + (Math.random() - 0.5) * 30;
     subSeeds.push([px, py]);
   }
 
-  // Build a mini Voronoi within this fragment's bounds
   const minX = Math.min(...vertices.map((v) => v[0]));
   const maxX = Math.max(...vertices.map((v) => v[0]));
   const minY = Math.min(...vertices.map((v) => v[1]));
@@ -260,9 +201,8 @@ export function refractureFragment(fragment, tapX, tapY) {
     const cellPoly = voronoi.cellPolygon(i);
     if (!cellPoly) continue;
 
-    // Clip to the parent fragment shape using Sutherland-Hodgman
     const clipped = clipToPolygon(cellPoly, vertices);
-    if (clipped.length >= 3 && polygonArea(clipped) > 50) {
+    if (clipped.length >= 3 && polygonArea(clipped) > 40) {
       subFragments.push({
         vertices: clipped,
         centroid: polygonCentroid(clipped),
@@ -275,10 +215,41 @@ export function refractureFragment(fragment, tapX, tapY) {
   return subFragments.length >= 2 ? subFragments : null;
 }
 
-/**
- * Sutherland-Hodgman polygon clipping.
- * Clips `subject` polygon to be inside `clip` polygon.
- */
+// ─── Geometry utilities ──────────────────────────────────────
+
+function clipPolygonToCircle(polygon, centerX, centerY, radius) {
+  return polygon.map((p) => {
+    const dx = p[0] - centerX;
+    const dy = p[1] - centerY;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+    if (dist > radius * 1.02) {
+      const scale = (radius * 1.02) / dist;
+      return [centerX + dx * scale, centerY + dy * scale];
+    }
+    return p;
+  });
+}
+
+export function polygonCentroid(vertices) {
+  let cx = 0, cy = 0;
+  for (const v of vertices) {
+    cx += v[0];
+    cy += v[1];
+  }
+  return [cx / vertices.length, cy / vertices.length];
+}
+
+export function polygonArea(vertices) {
+  let area = 0;
+  const n = vertices.length;
+  for (let i = 0; i < n; i++) {
+    const j = (i + 1) % n;
+    area += vertices[i][0] * vertices[j][1];
+    area -= vertices[j][0] * vertices[i][1];
+  }
+  return Math.abs(area) / 2;
+}
+
 function clipToPolygon(subject, clip) {
   let output = subject.map((p) => (Array.isArray(p) ? p : [p.x, p.y]));
   const clipVerts = clip.map((p) => (Array.isArray(p) ? p : [p.x, p.y]));
@@ -332,5 +303,3 @@ function intersect(a, b, c, d) {
 
   return [a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])];
 }
-
-export { polygonCentroid, polygonArea };
